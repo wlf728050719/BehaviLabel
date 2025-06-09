@@ -6,7 +6,7 @@
 ## Quick Start  
 
 **0.** Run the packaged EXE file or execute `python main.py` in a Python environment  
-*(运行打包好的exe文件或在Python环境下执行python main.py)*  
+*(点击[此处](https://github.com/wlf728050719/BehaviLabel/releases/download/v1.0.0/dist.zip)下载解压并运行打包好的exe文件*，或在Python环境下执行`python main.py`)
 
 **1.** Click the "Initialize" button to set:  
 - Root directory of videos to be labeled (待标注视频根目录)  
