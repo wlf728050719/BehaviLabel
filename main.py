@@ -1,16 +1,244 @@
 import threading
 import webbrowser
-import cv2
 import tkinter as tk
 from tkinter import filedialog
 from tkinter import ttk
-import os
 from packaging import version
 import requests
 from PIL import Image, ImageTk
 import time
+import numpy as np
+import cv2
+import onnxruntime
+import warnings
+import os
 
-from get_pose import process_frame, initialize_session
+warnings.filterwarnings("ignore")
+
+def initialize_session(model_path):
+    ''' 初始化ONNX Runtime会话 '''
+    # 颜色定义
+    palette = np.array([[255, 128, 0], [255, 153, 51], [255, 178, 102],
+                        [230, 230, 0], [255, 153, 255], [153, 204, 255],
+                        [255, 102, 255], [255, 51, 255], [102, 178, 255],
+                        [51, 153, 255], [255, 153, 153], [255, 102, 102],
+                        [255, 51, 51], [153, 255, 153], [102, 255, 102],
+                        [51, 255, 51], [0, 255, 0], [0, 0, 255], [255, 0, 0],
+                        [255, 255, 255]])
+
+    # 骨架连接定义 (COCO格式)
+    skeleton = [[16, 14], [14, 12], [17, 15], [15, 13], [12, 13], [6, 12],
+                [7, 13], [6, 7], [6, 8], [7, 9], [8, 10], [9, 11], [2, 3],
+                [1, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7]]
+
+    pose_limb_color = palette[[9, 9, 9, 9, 7, 7, 7, 0, 0, 0, 0, 0, 16, 16, 16, 16, 16, 16, 16]]
+    pose_kpt_color = palette[[16, 16, 16, 16, 16, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9]]
+
+    if not os.path.exists(model_path):
+        print(f"模型文件不存在: {model_path}")
+        return None
+
+    try:
+        session_options = onnxruntime.SessionOptions()
+        session_options.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        ort_session = onnxruntime.InferenceSession(model_path,
+                                                   session_options=session_options,
+                                                   providers=['CPUExecutionProvider'])
+        print(f"成功加载模型: {model_path}")
+        return ort_session
+    except Exception as e:
+        print(f"加载模型失败: {e}")
+        return None
+
+def process_frame(ort_session, img, conf_threshold=0.1):
+    ''' 处理单帧图像 '''
+    # 颜色定义 (重复定义以便函数独立)
+    palette = np.array([[255, 128, 0], [255, 153, 51], [255, 178, 102],
+                        [230, 230, 0], [255, 153, 255], [153, 204, 255],
+                        [255, 102, 255], [255, 51, 255], [102, 178, 255],
+                        [51, 153, 255], [255, 153, 153], [255, 102, 102],
+                        [255, 51, 51], [153, 255, 153], [102, 255, 102],
+                        [51, 255, 51], [0, 255, 0], [0, 0, 255], [255, 0, 0],
+                        [255, 255, 255]])
+
+    # 骨架连接定义 (COCO格式)
+    skeleton = [[16, 14], [14, 12], [17, 15], [15, 13], [12, 13], [6, 12],
+                [7, 13], [6, 7], [6, 8], [7, 9], [8, 10], [9, 11], [2, 3],
+                [1, 2], [1, 3], [2, 4], [3, 5], [4, 6], [5, 7]]
+
+    pose_limb_color = palette[[9, 9, 9, 9, 7, 7, 7, 0, 0, 0, 0, 0, 16, 16, 16, 16, 16, 16, 16]]
+    pose_kpt_color = palette[[16, 16, 16, 16, 16, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9]]
+
+    # 图像预处理 (letterbox功能)
+    shape = img.shape[:2]
+    new_shape = (640, 640)
+    r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
+    new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
+    dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
+    dw /= 2
+    dh /= 2
+    if shape[::-1] != new_unpad:
+        image1 = cv2.resize(img, new_unpad, interpolation=cv2.INTER_LINEAR)
+    top, bottom = int(round(dh - 0.1)), int(round(dh + 0.1))
+    left, right = int(round(dw - 0.1)), int(round(dw + 0.1))
+    image1 = cv2.copyMakeBorder(image1, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
+
+    # 图像归一化 (read_img功能)
+    img_mean = 0.0
+    img_scale = 0.00392156862745098
+    input = (image1 - img_mean) * img_scale
+    input = np.asarray(input, dtype=np.float32)
+    input = np.expand_dims(input, 0)
+    input = input.transpose(0, 3, 1, 2)
+
+    # 模型推理
+    input_name = ort_session.get_inputs()[0].name
+    output = ort_session.run([], {input_name: input})[0]
+
+    # 置信度过滤
+    output = output[output[..., 4] > conf_threshold]
+    if len(output) == 0:
+        return img, None  # 没有检测到任何目标，返回原图和空关键点
+
+    # 坐标转换 (xyxy2xywh功能)
+    det_box = np.copy(output)
+    det_box[:, 2] = output[:, 2] - output[:, 0]  # w
+    det_box[:, 3] = output[:, 3] - output[:, 1]  # h
+
+    # 坐标缩放 (scale_boxes功能)
+    img1_shape = image1.shape
+    img0_shape = img.shape
+    gain = min(img1_shape[0] / img0_shape[0], img1_shape[1] / img0_shape[1])
+    pad = (img1_shape[1] - img0_shape[1] * gain) / 2, (img1_shape[0] - img0_shape[0] * gain) / 2
+    det_box[:, 0] -= pad[0]
+    det_box[:, 1] -= pad[1]
+    det_box[:, :4] /= gain
+    num_kpts = det_box.shape[1] // 3
+    for kid in range(2, num_kpts):
+        det_box[:, kid * 3] = (det_box[:, kid * 3] - pad[0]) / gain
+        det_box[:, kid * 3 + 1] = (det_box[:, kid * 3 + 1] - pad[1]) / gain
+
+    # 裁剪框 (clip_boxes功能)
+    top_left_x = det_box[:, 0].clip(0, img0_shape[1])
+    top_left_y = det_box[:, 1].clip(0, img0_shape[0])
+    bottom_right_x = (det_box[:, 0] + det_box[:, 2]).clip(0, img0_shape[1])
+    bottom_right_y = (det_box[:, 1] + det_box[:, 3]).clip(0, img0_shape[0])
+    det_box[:, 0] = top_left_x
+    det_box[:, 1] = top_left_y
+    det_box[:, 2] = bottom_right_x
+    det_box[:, 3] = bottom_right_y
+
+    # 提取检测框和关键点
+    det_bboxes, det_scores, det_labels, kpts = det_box[:, 0:4], det_box[:, 4], det_box[:, 5], det_box[:, 6:]
+
+    # 绘制骨骼关键点 (plot_skeleton_kpts功能)
+    for idx in range(len(det_bboxes)):
+        kpt = kpts[idx]
+        steps = 3
+        num_kpts = len(kpt) // steps
+        for kid in range(num_kpts):
+            r, g, b = pose_kpt_color[kid]
+            x_coord, y_coord = kpt[steps * kid], kpt[steps * kid + 1]
+            conf = kpt[steps * kid + 2]
+            if conf > 0.5:
+                cv2.circle(img, (int(x_coord), int(y_coord)), 3, (int(r), int(g), int(b)), -1)
+        for sk_id, sk in enumerate(skeleton):
+            r, g, b = pose_limb_color[sk_id]
+            pos1 = (int(kpt[(sk[0] - 1) * steps]), int(kpt[(sk[0] - 1) * steps + 1]))
+            pos2 = (int(kpt[(sk[1] - 1) * steps]), int(kpt[(sk[1] - 1) * steps + 1]))
+            conf1 = kpt[(sk[0] - 1) * steps + 2]
+            conf2 = kpt[(sk[1] - 1) * steps + 2]
+            if conf1 > 0.5 and conf2 > 0.5:
+                cv2.line(img, pos1, pos2, (int(r), int(g), int(b)), thickness=2)
+
+    return img, kpts[0]  # 返回处理后的图像和第一个人的关键点
+
+def process_videos(video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
+    """实际处理视频的方法"""
+    # 确保输出目录存在
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    # 获取所有txt文件
+    txt_files = [f for f in os.listdir(txt_dir) if f.endswith('.txt')]
+    total_files = len(txt_files)
+
+    for i, txt_file in enumerate(txt_files):
+        # 更新进度和状态
+        progress = (i + 1) / total_files * 100
+        progress_var.set(progress)
+        status_label.config(text=f"正在处理 {txt_file} ({i + 1}/{total_files})")
+        top_window.update_idletasks()  # 使用传入的窗口对象更新UI
+
+        # 获取对应的视频文件路径
+        video_name = os.path.splitext(txt_file)[0]
+        video_path = os.path.join(video_dir, video_name)
+
+        # 检查是否有对应的视频文件（支持多种视频格式）
+        video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
+        found_video = False
+        for ext in video_extensions:
+            if os.path.exists(video_path + ext):
+                video_path += ext
+                found_video = True
+                break
+
+        if not found_video:
+            continue
+
+        # 读取视频
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            continue
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
+        # 读取txt文件内容
+        txt_path = os.path.join(txt_dir, txt_file)
+        with open(txt_path, 'r') as f:
+            lines = f.readlines()
+
+        # 处理每一行标记
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) < 3:
+                continue
+
+            start_frame = int(parts[0])
+            end_frame = int(parts[1])
+            action = parts[2]
+
+            # 确保行为文件夹存在
+            action_folder = os.path.join(output_dir, action)
+            if not os.path.exists(action_folder):
+                os.makedirs(action_folder)
+
+            # 创建输出视频文件名
+            output_name = f"{video_name}_{start_frame}_{end_frame}_{action}.mp4"
+            output_path = os.path.join(action_folder, output_name)
+
+            # 设置视频写入器
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+            # 跳转到起始帧
+            cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+
+            # 读取并写入指定范围内的帧
+            for frame_num in range(start_frame, end_frame + 1):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                out.write(frame)
+
+            out.release()
+
+        cap.release()
+
+    return True  # 返回成功状态
 
 
 class BehaviLabel:
@@ -645,7 +873,7 @@ class BehaviLabel:
                         tag_name = f"hyperlink_{url}"
 
                         # 配置当前链接样式
-                        text.tag_config(tag_name, foreground="blue", underline=1)
+                        text.tag_config(tag_name, foreground="blue", underline=True)
                         text.tag_bind(tag_name, "<Enter>",
                                       lambda e, t=text: t.config(cursor="hand2"))
                         text.tag_bind(tag_name, "<Leave>",
@@ -1069,7 +1297,7 @@ class BehaviLabel:
 
             # 开始处理
             try:
-                success = self.process_videos(
+                success = process_videos(
                     video_dir=selected_paths['video_dir'].get(),
                     txt_dir=selected_paths['txt_dir'].get(),
                     output_dir=selected_paths['output_dir'].get(),
@@ -1171,93 +1399,6 @@ class BehaviLabel:
     def toggle_auto_playing(self,event=None):
         self.auto_playing = not self.auto_playing
         self.auto_playing_var.set(self.auto_playing)
-
-    def process_videos(self, video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
-        """实际处理视频的方法"""
-        # 确保输出目录存在
-        if not os.path.exists(output_dir):
-            os.makedirs(output_dir)
-
-        # 获取所有txt文件
-        txt_files = [f for f in os.listdir(txt_dir) if f.endswith('.txt')]
-        total_files = len(txt_files)
-
-        for i, txt_file in enumerate(txt_files):
-            # 更新进度和状态
-            progress = (i + 1) / total_files * 100
-            progress_var.set(progress)
-            status_label.config(text=f"正在处理 {txt_file} ({i + 1}/{total_files})")
-            top_window.update_idletasks()  # 使用传入的窗口对象更新UI
-
-            # 获取对应的视频文件路径
-            video_name = os.path.splitext(txt_file)[0]
-            video_path = os.path.join(video_dir, video_name)
-
-            # 检查是否有对应的视频文件（支持多种视频格式）
-            video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
-            found_video = False
-            for ext in video_extensions:
-                if os.path.exists(video_path + ext):
-                    video_path += ext
-                    found_video = True
-                    break
-
-            if not found_video:
-                continue
-
-            # 读取视频
-            cap = cv2.VideoCapture(video_path)
-            if not cap.isOpened():
-                continue
-
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-            # 读取txt文件内容
-            txt_path = os.path.join(txt_dir, txt_file)
-            with open(txt_path, 'r') as f:
-                lines = f.readlines()
-
-            # 处理每一行标记
-            for line in lines:
-                parts = line.strip().split()
-                if len(parts) < 3:
-                    continue
-
-                start_frame = int(parts[0])
-                end_frame = int(parts[1])
-                action = parts[2]
-
-                # 确保行为文件夹存在
-                action_folder = os.path.join(output_dir, action)
-                if not os.path.exists(action_folder):
-                    os.makedirs(action_folder)
-
-                # 创建输出视频文件名
-                output_name = f"{video_name}_{start_frame}_{end_frame}_{action}.mp4"
-                output_path = os.path.join(action_folder, output_name)
-
-                # 设置视频写入器
-                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-                frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-                frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-
-                # 跳转到起始帧
-                cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-                # 读取并写入指定范围内的帧
-                for frame_num in range(start_frame, end_frame + 1):
-                    ret, frame = cap.read()
-                    if not ret:
-                        break
-                    out.write(frame)
-
-                out.release()
-
-            cap.release()
-
-        return True  # 返回成功状态
 
     def debug(self, string):
         if self.mode == 'debug':
