@@ -81,7 +81,6 @@ Supports checking for updates to use the latest version in a timely manner ⏲�
 ## <span id="behavilabel-zh"></span>  
 # BehaviLabel 🏷️  
 [Luofei Wang](https://github.com/wlf728050719)  
-**[View in English](#behavilabel) | [查看中文版](#behavilabel-1)**
 
 **快速视频行为标注工具** 🎥
 
