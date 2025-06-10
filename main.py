@@ -1,3 +1,4 @@
+import threading
 import webbrowser
 import cv2
 import tkinter as tk
@@ -6,6 +7,8 @@ from tkinter import ttk
 import os
 from PIL import Image, ImageTk
 import time
+
+from get_pose import process_frame, initialize_session
 
 
 class BehaviLabel:
@@ -34,12 +37,21 @@ class BehaviLabel:
         self.annotation_records = {}
         self.start_time = time.time()
         self.label_count = 0
+
+        self.draw_skeleton = False  # 是否绘制骨骼关键点的标志
+        self.conf_threshold = 0.3  # 置信度阈值
+        self.ort_session = None  # ONNX运行时会话
+        self.model_loading = False
+        self.model_loaded = False
+        self.model_load_failed = False
+        self.loading_message = None
+
         # 固定视频显示区域尺寸
         self.display_width = 1000  # 固定宽度
         self.display_height = 600  # 固定高度
         self.setup_ui()
         # 修改绑定方式，使用bind_all确保全局捕获空格键
-        self.root.bind_all('<space>', self.pause_continue)
+        self.root.bind_all('<space>', self.toggle_pause_continue)
         self.root.bind_all('<a>', self.last_video)
         self.root.bind_all('<d>', self.next_video)
         self.root.bind_all('<w>', self.set_start_frame)
@@ -49,6 +61,7 @@ class BehaviLabel:
         self.root.bind_all('<Down>', self.select_next_behavior)  # 添加下箭头绑定
         self.root.bind_all('<Left>', self.last_frame)
         self.root.bind_all('<Right>', self.next_frame)
+        self.root.bind_all('<r>', self.toggle_draw_skeleton)
         self.update()
 
     def update_working_time(self):
@@ -59,6 +72,9 @@ class BehaviLabel:
 
         filename_frame = tk.Frame(self.root)
         filename_frame.pack(side=tk.TOP, pady=5, fill=tk.X)
+
+        self.lb_draw_skeleton = tk.Label(filename_frame, text="骨骼绘制未启用", font=("Arial", 10),fg="red")
+        self.lb_draw_skeleton.pack(side=tk.LEFT,padx=5)
 
         self.lb_time = tk.Label(filename_frame, text="", font=("Arial", 10))
         self.lb_time.pack(side=tk.RIGHT, padx=5)
@@ -102,14 +118,15 @@ class BehaviLabel:
         self.base_menu.add_command(label="上一个视频(A)",command=self.last_video)
         self.base_menu.add_command(label="下一个视频(D)", command=self.next_video)
         self.base_menu.add_separator()
-        self.base_menu.add_command(label="快进(right)", command=self.next_frame)
-        self.base_menu.add_command(label="后退(left)", command=self.last_frame)
+        self.base_menu.add_command(label="快进(Right)", command=self.next_frame)
+        self.base_menu.add_command(label="后退(Left)", command=self.last_frame)
+        self.base_menu.add_command(label="暂停/继续(Space)", command=self.toggle_pause_continue)
         self.base_menu.add_separator()
         self.base_menu.add_command(label="设置起始帧(W)", command=self.set_start_frame)
         self.base_menu.add_command(label="设置结束帧(S)", command=self.set_end_frame)
         self.base_menu.add_separator()
-        self.base_menu.add_command(label="切换上一行为类型(up)",command=self.select_prev_behavior)
-        self.base_menu.add_command(label="切换下一行为类型(down)", command=self.select_next_behavior)
+        self.base_menu.add_command(label="切换上一行为类型(Up)",command=self.select_prev_behavior)
+        self.base_menu.add_command(label="切换下一行为类型(Down)", command=self.select_next_behavior)
         self.base_menu.add_separator()
         self.base_menu.add_command(label="确认标注(Enter)",command=self.confirm_annotation)
 
@@ -127,6 +144,9 @@ class BehaviLabel:
         self.util_menu = tk.Menu(self.root, tearoff=0)
         self.util_menu.add_command(label="视频分片", command=self.slice)
         self.util_menu.add_command(label="标记统计", command=self.show_statistics)
+        self.util_menu.add_separator()
+        self.util_menu.add_command(label="加载骨骼模型", command=self.load_model_async)
+        self.util_menu.add_command(label="启用关闭骨骼检测(R)", command=self.toggle_draw_skeleton)
 
 
         #关于菜单
@@ -503,7 +523,7 @@ class BehaviLabel:
             self.selected_behavior.set(self.labels[0])
         return "break"  # 阻止事件继续传播
 
-    def pause_continue(self, event=None):
+    def toggle_pause_continue(self, event=None):
         self.paused = not self.paused
         return "break"  # 阻止事件继续传播
 
@@ -675,8 +695,26 @@ class BehaviLabel:
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.cap.set(cv2.CAP_PROP_POS_FRAMES, self.current_frame)
         ret, frame = self.cap.read()
+
         if ret:
-            # 转换颜色空间
+            # 如果需要绘制骨骼关键点
+            if getattr(self, 'draw_skeleton', False):
+                # 检查模型状态
+                if not hasattr(self, 'ort_session'):
+                    self.load_model_async()
+                    # 显示原始帧，等待模型加载
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    return
+
+                # 只有模型已加载才进行处理
+                if self.model_loaded and hasattr(self, 'ort_session'):
+                    try:
+                        frame, _ = process_frame(self.ort_session, frame.copy(),self.conf_threshold)
+                    except Exception as e:
+                        print(f"骨骼检测处理出错: {e}")
+
+
+            # 转换和显示帧
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = Image.fromarray(frame)
 
@@ -1034,6 +1072,66 @@ class BehaviLabel:
         x = (top.winfo_screenwidth() // 2) - (width // 2)
         y = (top.winfo_screenheight() // 2) - (height // 2)
         top.geometry(f'+{x}+{y}')
+
+    def toggle_draw_skeleton(self,event=None):
+        if self.model_loaded:
+            self.draw_skeleton = not self.draw_skeleton
+            if self.draw_skeleton:
+                self.lb_draw_skeleton.config(text="骨骼绘制已启用")
+            else:
+                self.lb_draw_skeleton.config(text="骨骼绘制未启用")
+        else:
+            self.paused = True
+            self.show_custom_message("模型未加载")
+
+    def load_model_async(self):
+        """异步加载模型"""
+        if self.model_loaded:
+            self.show_custom_message("模型已经加载")
+            return
+        if self.model_loading:
+            self.show_custom_message("模型加载中")
+            return
+        if self.model_load_failed:
+            self.show_custom_message("模型加载错误")
+            return
+
+            # 弹出文件选择框
+        model_path = filedialog.askopenfilename(
+            title="选择ONNX模型文件",
+            filetypes=[("ONNX模型文件", "*.onnx")]
+        )
+        if not model_path:
+            self.show_custom_message("未选择模型文件")
+            return
+
+        self.model_loading = True
+        self.model_loaded = False
+        self.model_load_failed = False
+
+        # 显示加载提示
+        self.show_custom_message("模型加载中")
+        # 在后台线程加载模型
+        def load_task():
+            try:
+                self.ort_session = initialize_session(model_path)
+                if self.ort_session is not None:
+                    self.model_loaded = True
+                    self.model_load_failed = False
+                    self.draw_skeleton = True
+                    print("模型加载完成")
+                else:
+                    self.model_load_failed = True
+                    print("模型加载失败")
+            except Exception as e:
+                self.model_load_failed = True
+                print(f"模型加载异常: {e}")
+            finally:
+                self.model_loading = False
+                # 移除加载提示
+                self.show_custom_message("模型加载完毕")
+
+        threading.Thread(target=load_task, daemon=True).start()
 
     def _process_videos(self, video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
         """实际处理视频的方法"""
