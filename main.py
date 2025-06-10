@@ -5,6 +5,8 @@ import tkinter as tk
 from tkinter import filedialog
 from tkinter import ttk
 import os
+from packaging import version
+import requests
 from PIL import Image, ImageTk
 import time
 
@@ -13,6 +15,7 @@ from get_pose import process_frame, initialize_session
 
 class BehaviLabel:
     def __init__(self, root,mode):
+        self.version = '1.0.1'
         self.root = root
         self.label_file = None
         self.labels = []
@@ -37,7 +40,8 @@ class BehaviLabel:
         self.annotation_records = {}
         self.start_time = time.time()
         self.label_count = 0
-
+        self.auto_playing = False
+        self.auto_playing_var = tk.BooleanVar(value=self.auto_playing)
         self.draw_skeleton = False  # 是否绘制骨骼关键点的标志
         self.conf_threshold = 0.3  # 置信度阈值
         self.ort_session = None  # ONNX运行时会话
@@ -135,7 +139,7 @@ class BehaviLabel:
                                      command=lambda: self.show_menu(self.setting_menu, self.btn_setting))
         self.btn_setting.pack(side=tk.LEFT, padx=5)
         self.setting_menu = tk.Menu(self.root, tearoff=0)
-        self.setting_menu.add_command(label="连续播放", command=self.load_video_directory)
+        self.setting_menu.add_checkbutton(label="连续播放", command=self.toggle_auto_playing,variable=self.auto_playing_var)
 
         # 关于菜单
         self.btn_util = tk.Button(button_frame, text="工具 ▼",
@@ -146,7 +150,7 @@ class BehaviLabel:
         self.util_menu.add_command(label="标记统计", command=self.show_statistics)
         self.util_menu.add_separator()
         self.util_menu.add_command(label="加载骨骼模型", command=self.load_model_async)
-        self.util_menu.add_command(label="启用关闭骨骼检测(R)", command=self.toggle_draw_skeleton)
+        self.util_menu.add_command(label="启用/关闭骨骼检测(R)", command=self.toggle_draw_skeleton)
 
 
         #关于菜单
@@ -542,9 +546,12 @@ class BehaviLabel:
             self.show_frame(self.video_list[self.video_index])
             self.update_progress()
             self.load_records()
+            return True
         else:
             msg = f"已经是最后一个视频"
+            self.paused = True
             self.show_custom_message(msg)
+            return False
 
     def last_video(self,event=None):
         if self.video_index >= 1:
@@ -742,8 +749,13 @@ class BehaviLabel:
             self.current_frame += self.allowed_speed[self.speed_index]
 
         # 确保current_frame不超过视频总帧数
-        if self.current_frame >= self.total_frames:
-            self.current_frame = self.total_frames - 1
+        if self.current_frame >= self.total_frames :
+            if self.auto_playing: #自动播放时
+                if self.next_video():
+                   self.current_frame = 0
+                   self.paused = False
+            else:
+                self.current_frame = self.total_frames - 1
 
     def update_progress(self):
         """更新进度条和帧数显示"""
@@ -785,9 +797,33 @@ class BehaviLabel:
         self.show_custom_message(msg, links)
 
     def check_update(self):
-        """检查更新"""
-        # 这里可以添加实际的更新检查逻辑
-        self.show_custom_message("正在检查更新...\n暂未实现自动更新功能")
+        """检查更新，返回 True 表示是最新版本，False 表示需要更新"""
+        try:
+            url = "https://api.github.com/repos/wlf728050719/BehaviLabel/releases/latest"
+            response = requests.get(url, headers={"Accept": "application/vnd.github.v3+json"})
+
+            if response.status_code == 200:
+                latest_release = response.json()
+                latest_version = latest_release["tag_name"]
+
+                # 标准化版本号（去掉可能的 'v' 前缀）
+                current_version = self.version.lstrip('v')  # 如果 self.version = 'v1.0.0' 也能处理
+                latest_version = latest_version.lstrip('v')
+
+                # 使用 packaging.version 比较版本号
+                if version.parse(current_version) >= version.parse(latest_version):
+                    msg = "当前版本:" + self.version + "\n" + "最新版本:" + latest_version + "\n" + "已是最新版本"
+                    self.show_custom_message(msg)
+                else:
+                    msg = "当前版本:"+self.version+"\n"+"最新版本:"+latest_version+"\n"+"前往项目地址以获取最新版本"
+                    self.show_custom_message(msg)
+            else:
+                msg = "GitHub API 请求失败:ResponseCode"+str(response.status_code)
+                self.show_custom_message(msg)
+
+        except Exception as e:
+            msg ="GitHub API 请求失败:"+str(e)
+            self.show_custom_message(msg)
 
     def show_statistics(self):
         """统计标记信息功能"""
@@ -1033,7 +1069,7 @@ class BehaviLabel:
 
             # 开始处理
             try:
-                success = self._process_videos(
+                success = self.process_videos(
                     video_dir=selected_paths['video_dir'].get(),
                     txt_dir=selected_paths['txt_dir'].get(),
                     output_dir=selected_paths['output_dir'].get(),
@@ -1118,7 +1154,6 @@ class BehaviLabel:
                 if self.ort_session is not None:
                     self.model_loaded = True
                     self.model_load_failed = False
-                    self.draw_skeleton = True
                     print("模型加载完成")
                 else:
                     self.model_load_failed = True
@@ -1133,7 +1168,11 @@ class BehaviLabel:
 
         threading.Thread(target=load_task, daemon=True).start()
 
-    def _process_videos(self, video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
+    def toggle_auto_playing(self,event=None):
+        self.auto_playing = not self.auto_playing
+        self.auto_playing_var.set(self.auto_playing)
+
+    def process_videos(self, video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
         """实际处理视频的方法"""
         # 确保输出目录存在
         if not os.path.exists(output_dir):

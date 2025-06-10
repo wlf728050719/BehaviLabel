@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/LabelAction.iml" filepath="$PROJECT_DIR$/.idea/LabelAction.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/BehaviLabel.iml" filepath="$PROJECT_DIR$/.idea/BehaviLabel.iml" />
     </modules>
   </component>
 </project>
