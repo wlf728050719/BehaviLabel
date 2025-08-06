@@ -154,96 +154,144 @@ def process_frame(ort_session, img, conf_threshold=0.1):
     return img, kpts[0]  # 返回处理后的图像和第一个人的关键点
 
 def process_videos(video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
-    """实际处理视频的方法"""
+    """处理视频（进度条基于所有TXT文件的总记录数）"""
     # 确保输出目录存在
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    os.makedirs(output_dir, exist_ok=True)
 
-    # 获取所有txt文件
+    # 获取所有txt文件并预计算总记录数
     txt_files = [f for f in os.listdir(txt_dir) if f.endswith('.txt')]
-    total_files = len(txt_files)
+    if not txt_files:
+        status_label.config(text="错误：未找到TXT文件")
+        return False
 
-    for i, txt_file in enumerate(txt_files):
-        # 更新进度和状态
-        progress = (i + 1) / total_files * 100
-        progress_var.set(progress)
-        status_label.config(text=f"正在处理 {txt_file} ({i + 1}/{total_files})")
-        top_window.update_idletasks()  # 使用传入的窗口对象更新UI
+    # ==== 关键修改：统计所有文件的记录总数 ====
+    total_clips = 0
+    clip_info = []  # 存储每个文件的记录数和路径
+    for txt_file in txt_files:
+        txt_path = os.path.join(txt_dir, txt_file)
+        with open(txt_path, 'r') as f:
+            lines = [line.strip() for line in f if line.strip()]
+            clip_info.append({
+                "file": txt_file,
+                "path": txt_path,
+                "lines": lines,
+                "count": len(lines)
+            })
+            total_clips += len(lines)
 
-        # 获取对应的视频文件路径
+    if total_clips == 0:
+        status_label.config(text="错误：TXT文件中无有效记录")
+        return False
+
+    # 初始化进度
+    current_clip = 0
+    start_time = time.time()
+
+    # 处理每个TXT文件
+    for info in clip_info:
+        txt_file = info["file"]
+        lines = info["lines"]
+
+        # 查找对应的视频文件
         video_name = os.path.splitext(txt_file)[0]
-        video_path = os.path.join(video_dir, video_name)
-
-        # 检查是否有对应的视频文件（支持多种视频格式）
-        video_extensions = ['.mp4', '.avi', '.mov', '.mkv']
-        found_video = False
-        for ext in video_extensions:
-            if os.path.exists(video_path + ext):
-                video_path += ext
-                found_video = True
+        video_path = None
+        for ext in ['.mp4', '.avi', '.mov', '.mkv']:
+            test_path = os.path.join(video_dir, f"{video_name}{ext}")
+            if os.path.exists(test_path):
+                video_path = test_path
                 break
 
-        if not found_video:
+        if not video_path:
+            current_clip += info["count"]  # 跳过无效文件但仍更新进度
             continue
 
         # 读取视频
         cap = cv2.VideoCapture(video_path)
         if not cap.isOpened():
+            current_clip += info["count"]
             continue
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-
-        # 读取txt文件内容
-        txt_path = os.path.join(txt_dir, txt_file)
-        with open(txt_path, 'r') as f:
-            lines = f.readlines()
-
-        # 处理每一行标记
+        # 处理每条记录
         for line in lines:
-            parts = line.strip().split()
+            current_clip += 1
+            progress = current_clip / total_clips * 100
+            progress_var.set(progress)
+
+            # 计算时间信息
+            elapsed = time.time() - start_time
+            avg_time = elapsed / current_clip
+            remaining = max(0, avg_time * (total_clips - current_clip))
+
+            # 更新状态
+            status_label.config(
+                text=f"处理: {video_name} | 进度: {current_clip}/{total_clips} | "
+                     f"已用: {time.strftime('%H:%M:%S', time.gmtime(elapsed))} | "
+                     f"剩余: {time.strftime('%H:%M:%S', time.gmtime(remaining))}"
+            )
+            top_window.update_idletasks()
+
+            # 解析记录（格式: start_frame end_frame action [x1,y1,x2,y2]）
+            parts = line.split()
             if len(parts) < 3:
                 continue
 
             start_frame = int(parts[0])
             end_frame = int(parts[1])
             action = parts[2]
+            selection = None
 
-            # 确保行为文件夹存在
-            action_folder = os.path.join(output_dir, action)
-            if not os.path.exists(action_folder):
-                os.makedirs(action_folder)
+            # 解析框选坐标
+            if len(parts) >= 4 and ',' in parts[3]:
+                try:
+                    coords = list(map(int, parts[3].split(',')))
+                    if coords[0] < coords[2] and coords[1] < coords[3]:
+                        selection = coords
+                except:
+                    pass
 
-            # 创建输出视频文件名
-            output_name = f"{video_name}_{start_frame}_{end_frame}_{action}.mp4"
-            output_path = os.path.join(action_folder, output_name)
+            # 写入视频片段
+            output_folder = os.path.join(output_dir, action)
+            os.makedirs(output_folder, exist_ok=True)
+            output_name = (
+                f"{video_name}_{start_frame}_{end_frame}_{action}"
+                f"{f'_{selection[0]}_{selection[1]}_{selection[2]}_{selection[3]}' if selection else ''}.mp4"
+            )
+            output_path = os.path.join(output_folder, output_name)
 
-            # 设置视频写入器
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            out = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+            # 配置视频写入器
+            width = (selection[2] - selection[0]) if selection else int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = (selection[3] - selection[1]) if selection else int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            out = cv2.VideoWriter(
+                output_path,
+                cv2.VideoWriter_fourcc(*'mp4v'),
+                cap.get(cv2.CAP_PROP_FPS),
+                (width, height)
+            )
 
-            # 跳转到起始帧
+            # 提取并写入帧
             cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-
-            # 读取并写入指定范围内的帧
-            for frame_num in range(start_frame, end_frame + 1):
+            for _ in range(start_frame, end_frame + 1):
                 ret, frame = cap.read()
                 if not ret:
                     break
+                if selection:
+                    frame = frame[selection[1]:selection[3], selection[0]:selection[2]]
                 out.write(frame)
-
             out.release()
 
         cap.release()
 
-    return True  # 返回成功状态
+    # 最终状态
+    elapsed = time.time() - start_time
+    status_label.config(
+        text=f"完成！处理 {total_clips} 条记录 | 总用时: {time.strftime('%H:%M:%S', time.gmtime(elapsed))}"
+    )
+    return True
 
 
 class BehaviLabel:
     def __init__(self, root,mode):
-        self.version = '1.0.1'
+        self.version = '1.0.2'
         self.root = root
         self.label_file = None
         self.labels = []
@@ -277,6 +325,12 @@ class BehaviLabel:
         self.model_loaded = False
         self.model_load_failed = False
         self.loading_message = None
+
+        self.selecting = False
+        self.selection_start = None
+        self.selection_end = None
+        self.selection_rect = None
+        self.enable_selection = False  # 是否启用框选模式
 
         # 固定视频显示区域尺寸
         self.display_width = 1000  # 固定宽度
@@ -368,7 +422,7 @@ class BehaviLabel:
         self.btn_setting.pack(side=tk.LEFT, padx=5)
         self.setting_menu = tk.Menu(self.root, tearoff=0)
         self.setting_menu.add_checkbutton(label="连续播放", command=self.toggle_auto_playing,variable=self.auto_playing_var)
-
+        self.setting_menu.add_checkbutton(label="启用框选模式", command=self.toggle_selection_mode)
         # 关于菜单
         self.btn_util = tk.Button(button_frame, text="工具 ▼",
                                    command=lambda: self.show_menu(self.util_menu, self.btn_util))
@@ -394,6 +448,7 @@ class BehaviLabel:
         #倍速按钮
         self.btn_change_speed = tk.Button(button_frame, text="1倍速", command=self.change_speed)
         self.btn_change_speed.pack(side=tk.LEFT, padx=5)
+
 
         # 视频播放区域 - 固定大小的黑色背景
         self.video_canvas = tk.Canvas(left_frame,
@@ -481,6 +536,65 @@ class BehaviLabel:
         self.video_listbox.bind('<<ListboxSelect>>', self.on_video_select)
         self.video_listbox.bind('<FocusIn>', lambda e: self.root.focus_set())
 
+    def toggle_selection_mode(self):
+        """切换框选模式"""
+        self.enable_selection = not self.enable_selection
+        if self.enable_selection:
+            self.show_custom_message("框选模式已启用，请在视频区域拖动鼠标选择区域")
+            # 绑定鼠标事件
+            self.video_canvas.bind("<Button-1>", self.start_selection)
+            self.video_canvas.bind("<B1-Motion>", self.update_selection)
+            self.video_canvas.bind("<ButtonRelease-1>", self.end_selection)
+            # 如果有选择区域，重新绘制
+            if self.selection_start and self.selection_end:
+                self.draw_selection_rect()
+        else:
+            self.show_custom_message("框选模式已关闭")
+            # 解绑鼠标事件
+            self.video_canvas.unbind("<Button-1>")
+            self.video_canvas.unbind("<B1-Motion>")
+            self.video_canvas.unbind("<ButtonRelease-1>")
+            # 清除当前选择
+            self.clear_selection()
+
+    def start_selection(self, event):
+        """开始框选"""
+        if not self.enable_selection:
+            return
+
+        self.selecting = True
+        self.selection_start = (event.x, event.y)
+        self.selection_end = (event.x, event.y)
+        self.draw_selection_rect()
+
+    def update_selection(self, event):
+        """更新框选区域"""
+        if not self.selecting:
+            return
+
+        self.selection_end = (event.x, event.y)
+        self.draw_selection_rect()
+
+    def end_selection(self, event):
+        """结束框选"""
+        self.selecting = False
+        # 确保选择区域有效
+        if abs(self.selection_end[0] - self.selection_start[0]) < 10 or \
+                abs(self.selection_end[1] - self.selection_start[1]) < 10:
+            self.clear_selection()
+        else:
+            self.draw_selection_rect()
+
+    def clear_selection(self):
+        """清除当前选择"""
+        if self.selection_rect:
+            self.video_canvas.delete(self.selection_rect)
+            self.selection_rect = None
+        self.selection_start = None
+        self.selection_end = None
+        # 确保选择框从画布上完全移除
+        self.video_canvas.delete("selection_rect")
+
     def operate_record(self, event):
         """右键点击标注记录时弹出提示框"""
         # 获取点击位置的索引
@@ -506,12 +620,58 @@ class BehaviLabel:
             popup.grab_release()
 
     def set_record_start_frame(self, record):
-        frame_range, behavior = record.split(": ")
-        start_frame, end_frame = map(int, frame_range.split("-"))
-        self.current_frame = start_frame
-        self.paused = True
-        self.show_frame(self.video_list[self.video_index])
-        self.update_progress()
+        """定位到记录对应的起始帧并显示选择框"""
+        try:
+            # 解析记录字符串，格式如："38-66: eat 1370,544,1872,1157" 或 "38-66: eat"
+            frame_range, rest = record.split(": ", 1)
+            start_frame, end_frame = map(int, frame_range.split("-"))
+
+            # 尝试解析选择框坐标
+            selection = None
+            if ',' in rest:
+                # 格式为 "eat 1370,544,1872,1157" 或 "1370,544,1872,1157"
+                parts = rest.split()
+                coords_str = parts[-1] if len(parts) > 1 and ',' in parts[-1] else rest
+                if coords_str.count(',') == 3:
+                    selection = list(map(int, coords_str.split(',')))
+
+            # 更新当前帧
+            self.current_frame = start_frame
+            self.paused = True
+
+            # 更新选择框坐标
+            if selection:
+                # 计算显示比例和偏移量
+                display_width = self.video_canvas.winfo_width()
+                display_height = self.video_canvas.winfo_height()
+                ratio = min(display_width / self.video_width,
+                            display_height / self.video_height)
+                new_width = int(self.video_width * ratio)
+                new_height = int(self.video_height * ratio)
+                x_offset = (display_width - new_width) // 2
+                y_offset = (display_height - new_height) // 2
+
+                # 转换坐标到显示尺寸
+                x1 = x_offset + int(selection[0] * ratio)
+                y1 = y_offset + int(selection[1] * ratio)
+                x2 = x_offset + int(selection[2] * ratio)
+                y2 = y_offset + int(selection[3] * ratio)
+
+                # 更新选择框
+                self.selection_start = (x1, y1)
+                self.selection_end = (x2, y2)
+                self.enable_selection = True
+            else:
+                # 如果没有选择框坐标，清除当前选择
+                self.clear_selection()
+
+            # 显示帧并更新选择框
+            self.show_frame(self.video_list[self.video_index])
+            self.update_progress()
+
+        except Exception as e:
+            print(f"定位记录失败: {e}")
+            self.show_custom_message(f"定位记录失败: {str(e)}")
 
     def delete_annotation_record(self, index):
         """从TXT文件中删除指定的标注记录"""
@@ -570,6 +730,7 @@ class BehaviLabel:
                           button.winfo_rooty() + button.winfo_height())
         finally:
             menu.grab_release()
+
     def update(self):
         if len(self.video_list) > 0 and not self.paused:
             self.show_frame(self.video_list[self.video_index])
@@ -676,6 +837,45 @@ class BehaviLabel:
             self.show_custom_message("请先设置起始帧和结束帧")
             return
 
+        # 如果有框选区域，获取坐标
+        selection_coords = None
+        if self.selection_start and self.selection_end:
+            # 转换为视频原始坐标
+            display_width = self.video_canvas.winfo_width()
+            display_height = self.video_canvas.winfo_height()
+
+            # 计算缩放比例
+            ratio = min(display_width / self.video_width,
+                        display_height / self.video_height)
+            new_width = int(self.video_width * ratio)
+            new_height = int(self.video_height * ratio)
+
+            # 计算偏移量
+            x_offset = (display_width - new_width) // 2
+            y_offset = (display_height - new_height) // 2
+
+            # 转换坐标
+            x1 = max(0, min(self.selection_start[0], self.selection_end[0]))
+            y1 = max(0, min(self.selection_start[1], self.selection_end[1]))
+            x2 = min(new_width, max(self.selection_start[0], self.selection_end[0]))
+            y2 = min(new_height, max(self.selection_start[1], self.selection_end[1]))
+
+            # 转换为原始视频坐标
+            x1 = int((x1 - x_offset) / ratio)
+            y1 = int((y1 - y_offset) / ratio)
+            x2 = int((x2 - x_offset) / ratio)
+            y2 = int((y2 - y_offset) / ratio)
+
+            # 确保坐标在视频范围内
+            x1 = max(0, min(x1, self.video_width - 1))
+            y1 = max(0, min(y1, self.video_height - 1))
+            x2 = max(0, min(x2, self.video_width - 1))
+            y2 = max(0, min(y2, self.video_height - 1))
+
+            # 确保x2 > x1且y2 > y1
+            if x2 > x1 and y2 > y1:
+                selection_coords = f"{x1},{y1},{x2},{y2}"
+
         # 确保保存目录已设置
         if not self.save_dir:
             self.show_custom_message("请先设置保存目录")
@@ -696,20 +896,24 @@ class BehaviLabel:
         try:
             # 写入标注信息(追加模式)
             with open(save_path, 'a', encoding='utf-8') as f:
-                f.write(f"{self.start_frame} {self.end_frame} {behavior}\n")
+                if selection_coords:
+                    f.write(f"{self.start_frame} {self.end_frame} {behavior} {selection_coords}\n")
+                else:
+                    f.write(f"{self.start_frame} {self.end_frame} {behavior}\n")
         except Exception as e:
             self.show_custom_message(f"保存标注失败: {str(e)}")
             return
 
-        # 重置帧标记
+        # 重置帧标记和选择区域
         self.start_frame = None
         self.end_frame = None
+        self.clear_selection()
         self.start_frame_label.config(text="未设置")
         self.end_frame_label.config(text="未设置")
         self.load_records()
 
-        self.label_count+=1
-        self.lb_count.config(text="标记数目("+str(self.label_count)+")")
+        self.label_count += 1
+        self.lb_count.config(text="标记数目(" + str(self.label_count) + ")")
 
     def last_frame(self,event=None):
         self.paused = True
@@ -944,10 +1148,9 @@ class BehaviLabel:
                 # 只有模型已加载才进行处理
                 if self.model_loaded and hasattr(self, 'ort_session'):
                     try:
-                        frame, _ = process_frame(self.ort_session, frame.copy(),self.conf_threshold)
+                        frame, _ = process_frame(self.ort_session, frame.copy(), self.conf_threshold)
                     except Exception as e:
                         print(f"骨骼检测处理出错: {e}")
-
 
             # 转换和显示帧
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -972,18 +1175,34 @@ class BehaviLabel:
                                            anchor=tk.NW,
                                            image=self.current_photo)
 
+            # 如果有选择区域，重新绘制选择框
+            if self.enable_selection and self.selection_start and self.selection_end:
+                self.draw_selection_rect()
+
         # 只有在播放状态下才前进到下一帧
         if not self.paused:
             self.current_frame += self.allowed_speed[self.speed_index]
 
         # 确保current_frame不超过视频总帧数
-        if self.current_frame >= self.total_frames :
-            if self.auto_playing: #自动播放时
+        if self.current_frame >= self.total_frames:
+            if self.auto_playing:  # 自动播放时
                 if self.next_video():
-                   self.current_frame = 0
-                   self.paused = False
+                    self.current_frame = 0
+                    self.paused = False
             else:
                 self.current_frame = self.total_frames - 1
+
+    def draw_selection_rect(self):
+        """绘制选择框"""
+        if self.selection_rect:
+            self.video_canvas.delete(self.selection_rect)
+
+        if self.selection_start and self.selection_end:
+            self.selection_rect = self.video_canvas.create_rectangle(
+                self.selection_start[0], self.selection_start[1],
+                self.selection_end[0], self.selection_end[1],
+                outline='red', width=2, dash=(5, 5)
+            )
 
     def update_progress(self):
         """更新进度条和帧数显示"""
