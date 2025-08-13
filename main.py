@@ -50,7 +50,7 @@ def initialize_session(model_path):
         print(f"加载模型失败: {e}")
         return None
 
-def process_frame(ort_session, img, conf_threshold=0.1):
+def show_skeleton_frame(ort_session, img, conf_threshold=0.1):
     ''' 处理单帧图像 '''
     # 颜色定义 (重复定义以便函数独立)
     palette = np.array([[255, 128, 0], [255, 153, 51], [255, 178, 102],
@@ -153,7 +153,7 @@ def process_frame(ort_session, img, conf_threshold=0.1):
 
     return img, kpts[0]  # 返回处理后的图像和第一个人的关键点
 
-def process_videos(video_dir, txt_dir, output_dir, progress_var, status_label, top_window):
+def export_cropped_video(video_dir, txt_dir, output_dir, progress_var, status_label, top_window, crop):
     """处理视频（进度条基于所有TXT文件的总记录数）"""
     # 确保输出目录存在
     os.makedirs(output_dir, exist_ok=True)
@@ -241,7 +241,7 @@ def process_videos(video_dir, txt_dir, output_dir, progress_var, status_label, t
             selection = None
 
             # 解析框选坐标
-            if len(parts) >= 4 and ',' in parts[3]:
+            if len(parts) >= 4 and ',' in parts[3] and crop:
                 try:
                     coords = list(map(int, parts[3].split(',')))
                     if coords[0] < coords[2] and coords[1] < coords[3]:
@@ -291,7 +291,7 @@ def process_videos(video_dir, txt_dir, output_dir, progress_var, status_label, t
 
 class BehaviLabel:
     def __init__(self, root,mode):
-        self.version = '1.0.2'
+        self.version = '1.0.3'
         self.root = root
         self.label_file = None
         self.labels = []
@@ -428,7 +428,7 @@ class BehaviLabel:
                                    command=lambda: self.show_menu(self.util_menu, self.btn_util))
         self.btn_util.pack(side=tk.LEFT, padx=5)
         self.util_menu = tk.Menu(self.root, tearoff=0)
-        self.util_menu.add_command(label="视频分片", command=self.slice)
+        self.util_menu.add_command(label="视频分片", command=self.export)
         self.util_menu.add_command(label="标记统计", command=self.show_statistics)
         self.util_menu.add_separator()
         self.util_menu.add_command(label="加载骨骼模型", command=self.load_model_async)
@@ -1148,7 +1148,7 @@ class BehaviLabel:
                 # 只有模型已加载才进行处理
                 if self.model_loaded and hasattr(self, 'ort_session'):
                     try:
-                        frame, _ = process_frame(self.ort_session, frame.copy(), self.conf_threshold)
+                        frame, _ = show_skeleton_frame(self.ort_session, frame.copy(), self.conf_threshold)
                     except Exception as e:
                         print(f"骨骼检测处理出错: {e}")
 
@@ -1276,7 +1276,7 @@ class BehaviLabel:
         """统计标记信息功能"""
         # 创建统计窗口
         stat_window = tk.Toplevel(self.root)
-        stat_window.title("标记统计")
+        stat_window.title("统计信息")
         stat_window.attributes('-topmost', True)
         stat_window.grab_set()
 
@@ -1416,20 +1416,21 @@ class BehaviLabel:
         y = (stat_window.winfo_screenheight() // 2) - (height // 2)
         stat_window.geometry(f'+{x}+{y}')
 
-    def slice(self):
+    def export(self):
         """视频分片功能主方法"""
         # 创建选择窗口并设置为顶级窗口
         top = tk.Toplevel(self.root)
-        top.title("视频分片设置")
+        top.title("视频导出")
         top.resizable(False, False)
         top.attributes('-topmost', True)  # 设置为最顶层
         top.grab_set()  # 独占焦点
 
-        # 存储选择的路径
+        # 存储选择的路径和模式
         selected_paths = {
             'video_dir': tk.StringVar(value=self.video_dir),
             'txt_dir': tk.StringVar(value=self.save_dir),
-            'output_dir': tk.StringVar()
+            'output_dir': tk.StringVar(),
+            'crop_mode': tk.BooleanVar(value=False)  # 默认不裁剪
         }
 
         # 创建进度条变量
@@ -1493,6 +1494,18 @@ class BehaviLabel:
         tk.Entry(output_frame, textvariable=selected_paths['output_dir'], width=40).pack(side=tk.LEFT, padx=5)
         tk.Button(output_frame, text="浏览...", command=select_output_dir).pack(side=tk.LEFT)
 
+        # 裁剪模式选择
+        crop_frame = tk.Frame(main_frame)
+        crop_frame.pack(fill=tk.X, pady=5)
+        tk.Label(crop_frame, text="导出模式:").pack(side=tk.LEFT)
+
+        # Radiobuttons for choosing crop mode
+        crop_yes = tk.Radiobutton(crop_frame, text="指定区域", variable=selected_paths['crop_mode'], value=True)
+        crop_no = tk.Radiobutton(crop_frame, text="完整画面", variable=selected_paths['crop_mode'], value=False)
+
+        crop_yes.pack(side=tk.LEFT, padx=5)
+        crop_no.pack(side=tk.LEFT)
+
         # 进度条
         progress_frame = tk.Frame(main_frame)
         progress_frame.pack(fill=tk.X, pady=10)
@@ -1511,18 +1524,22 @@ class BehaviLabel:
                 self.show_custom_message("请选择输出目录")
                 return
 
+            # 获取用户选择的裁剪模式
+            crop_selected = selected_paths['crop_mode'].get()
+
             # 禁用按钮
             confirm_btn.config(state=tk.DISABLED)
 
             # 开始处理
             try:
-                success = process_videos(
+                success = export_cropped_video(
                     video_dir=selected_paths['video_dir'].get(),
                     txt_dir=selected_paths['txt_dir'].get(),
                     output_dir=selected_paths['output_dir'].get(),
                     progress_var=progress_var,
                     status_label=status_label,
-                    top_window=top
+                    top_window=top,
+                    crop=crop_selected  # 将裁剪模式传递给处理函数
                 )
 
                 # 处理完成后关闭进度窗口
